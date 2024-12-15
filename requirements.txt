@@ -1,0 +1,16 @@
+# Requirements for SIMP Project
+
+# Networking library for UDP communication (built-in)
+socket
+
+# Logging for debugging and error handling
+logging
+
+# For command-line argument parsing
+argparse
+
+# Time-based operations for retransmissions
+time
+
+# JSON for structured client-daemon communication
+json
