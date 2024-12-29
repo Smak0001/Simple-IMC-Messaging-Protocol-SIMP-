@@ -1,104 +1,134 @@
 import socket
-import argparse
-import logging
-import json
+import threading
+import time
 
-def main():
-    # Set up argument parsing
-    parser = argparse.ArgumentParser(description="SIMP Client")
-    parser.add_argument("daemon_ip", help="IP address of the SIMP daemon")
-    args = parser.parse_args()
+# Constants
+CONTROL_PORT = 7777
+SEQUENCE_NUMBERS = [0x00, 0x01]
+DAEMON_PORT = 7777
+TIMEOUT = 5  # Timeout for stop-and-wait in seconds
 
-    # Configure logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-    # Define client-to-daemon communication port
-    CLIENT_PORT = 7778
-    DAEMON_PORT = 7777
+# Helper functions
+def create_header(datagram_type, operation, sequence, username, length):
+    username = username.ljust(32)[:32].encode('ascii')
+    return bytes([datagram_type, operation, sequence]) + username + length.to_bytes(4, 'big')
 
-    # Create a UDP socket
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    client_socket.bind(("", CLIENT_PORT))
 
-    logging.info(f"SIMP Client started. Bound to port {CLIENT_PORT}.")
+def parse_header(header):
+    datagram_type = header[0]
+    operation = header[1]
+    sequence = header[2]
+    username = header[3:35].decode('ascii').strip()
+    length = int.from_bytes(header[35:39], 'big')
+    return datagram_type, operation, sequence, username, length
 
-    try:
-        # Register with the daemon
-        username = input("Enter your username: ")
-        registration_message = {
-            "type": "register",
-            "username": username
-        }
-        client_socket.sendto(json.dumps(registration_message).encode(), (args.daemon_ip, DAEMON_PORT))
+
+# SIMP Client
+class SIMPClient:
+    def __init__(self, daemon_ip, client_port):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("", client_port))
+        self.daemon_ip = daemon_ip
+        self.username = ""
+        self.sequence = 0x00
+        self.chat_started = False
+        self.waiting_for_ack = False
+        self.last_sent_message = None
+
+
+    def send_control_message(self, operation, payload=""):
+        header = create_header(0x01, operation, self.sequence, self.username, len(payload))
+        message = header + payload.encode('ascii')
+        self.socket.sendto(message, (self.daemon_ip, DAEMON_PORT))
+        return message
+
+
+    def send_chat_message(self, message):
+        header = create_header(0x02, 0x01, self.sequence, self.username, len(message))
+        datagram = header + message.encode('ascii')
+        self.socket.sendto(datagram, (self.daemon_ip, DAEMON_PORT))
+        self.last_sent_message = datagram
+        self.waiting_for_ack = True
+        return datagram
+
+
+    def resend_last_message(self):
+        if self.last_sent_message:
+          print("Resending message...")
+          self.socket.sendto(self.last_sent_message, (self.daemon_ip, DAEMON_PORT))
+
+
+    def receive_messages(self):
+        while True:
+            try:
+                message, _ = self.socket.recvfrom(1024)
+                datagram_type, operation, sequence, username, length = parse_header(message[:39])
+                payload = message[39:].decode('ascii')
+
+                if datagram_type == 0x01:
+                    if operation == 0x01: # ERR
+                        print(f"Error: {payload}")
+                    elif operation == 0x04: # ACK
+                        if self.waiting_for_ack:
+                            print("Chat message confirmed")
+                            self.waiting_for_ack = False
+                            self.sequence = SEQUENCE_NUMBERS[(SEQUENCE_NUMBERS.index(self.sequence) + 1) % 2]
+                        elif not self.chat_started:
+                           print("Chat confirmed")
+                           self.chat_started = True
+                    elif operation == 0x06:  # SYN + ACK
+                            print("Received SYN+ACK")
+                            self.send_control_message(0x04) # Send ACK
+                            self.chat_started = True
+                            print("Chat confirmed")
+
+
+
+                elif datagram_type == 0x02:
+                    print(f"[{username}] {payload}")
+
+
+            except Exception as e:
+                print(f"Error receiving message: {e}")
+
+
+    def run(self):
+        self.username = input("Enter your username: ").strip()
+        threading.Thread(target=self.receive_messages, daemon=True).start()
 
         while True:
-            print("Options:")
-            print("1. Start a new chat")
-            print("2. Wait for chat requests")
-            print("q. Quit")
-            choice = input("Enter your choice: ")
+            command = input("Enter command (start, send, quit): ")
+            if command == "start":
+                target = input("Enter target IP and port (e.g., 127.0.0.1:5000): ").strip()
+                print("Sending SYN")
+                self.send_control_message(0x02, target) #Send SYN
+                start_time = time.time()
+                while not self.chat_started:
+                    if time.time() - start_time > TIMEOUT:
+                        print("Timeout, resending SYN")
+                        self.send_control_message(0x02, target)
+                        start_time = time.time()
+                    time.sleep(0.1)
 
-            if choice == "1":
-                target_ip = input("Enter the IP address of the user to chat with: ")
-                chat_request = {
-                    "type": "chat_request",
-                    "target_ip": target_ip
-                }
-                client_socket.sendto(json.dumps(chat_request).encode(), (args.daemon_ip, DAEMON_PORT))
+            elif command.startswith("send "):
+                message = command[5:]
+                self.send_chat_message(message)
+                start_time = time.time()
 
-            elif choice == "2":
-                logging.info("Waiting for incoming chat requests...")
-                while True:
-                    data, addr = client_socket.recvfrom(1024)
-                    message = json.loads(data.decode())
+                while self.waiting_for_ack:
+                   if time.time() - start_time > TIMEOUT:
+                        self.resend_last_message()
+                        start_time = time.time()
+                   time.sleep(0.1)
 
-                    if message.get("type") == "chat_request":
-                        print(f"Chat request received from {message['username']} ({addr[0]}).")
-                        response = input("Accept (y/n)? ")
-                        if response.lower() == "y":
-                            accept_message = {
-                                "type": "chat_accept",
-                                "target_ip": addr[0]
-                            }
-                            client_socket.sendto(json.dumps(accept_message).encode(), (args.daemon_ip, DAEMON_PORT))
-                            chat(client_socket, addr[0])
-                        else:
-                            decline_message = {
-                                "type": "chat_decline",
-                                "target_ip": addr[0]
-                            }
-                            client_socket.sendto(json.dumps(decline_message).encode(), (args.daemon_ip, DAEMON_PORT))
-                            logging.info("Chat request declined.")
-                        break
-
-            elif choice == "q":
-                quit_message = {
-                    "type": "quit"
-                }
-                client_socket.sendto(json.dumps(quit_message).encode(), (args.daemon_ip, DAEMON_PORT))
-                logging.info("Exiting SIMP Client.")
+            elif command == "quit":
+                self.send_control_message(0x08)
                 break
-
-            else:
-                print("Invalid option. Please try again.")
-
-    except KeyboardInterrupt:
-        logging.info("Client terminated by user.")
-    finally:
-        client_socket.close()
-
-def chat(client_socket, target_ip):
-    print("Chat session started. Type 'exit' to end the chat.")
-    while True:
-        message = input("You: ")
-        if message.lower() == "exit":
-            logging.info("Chat session ended.")
-            break
-        chat_message = {
-            "type": "chat_message",
-            "message": message
-        }
-        client_socket.sendto(json.dumps(chat_message).encode(), (target_ip, 7777))
+        self.socket.close()
 
 if __name__ == "__main__":
-    main()
+    daemon_ip = input("Enter daemon IP address: ").strip()
+    client_port = int(input("Enter the port you want to bind to: ").strip())
+    client = SIMPClient(daemon_ip, client_port)
+    client.run()

@@ -1,102 +1,110 @@
 import socket
 import threading
-import json
-import logging
 
-# Configuration
-DAEMON_PORT = 7777
-CLIENT_PORT = 7778
+# Constants
+CONTROL_PORT = 7777
+SEQUENCE_NUMBERS = [0x00, 0x01]
 
-# In-memory storage for active connections
-active_chats = {}
 
-def main():
-    # Configure logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# Helper functions
+def create_header(datagram_type, operation, sequence, username, length):
+    username = username.ljust(32)[:32].encode('ascii')
+    return bytes([datagram_type, operation, sequence]) + username + length.to_bytes(4, 'big')
 
-    # Create a UDP socket for the daemon
-    daemon_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    daemon_socket.bind(("", DAEMON_PORT))
 
-    logging.info(f"SIMP Daemon started and listening on port {DAEMON_PORT}.")
+def parse_header(header):
+    datagram_type = header[0]
+    operation = header[1]
+    sequence = header[2]
+    username = header[3:35].decode('ascii').strip()
+    length = int.from_bytes(header[35:39], 'big')
+    return datagram_type, operation, sequence, username, length
 
-    try:
-        while True:
-            data, addr = daemon_socket.recvfrom(1024)
-            threading.Thread(target=handle_request, args=(daemon_socket, data, addr)).start()
-    except KeyboardInterrupt:
-        logging.info("Daemon terminated by user.")
-    finally:
-        daemon_socket.close()
 
-def handle_request(daemon_socket, data, addr):
-    try:
-        message = json.loads(data.decode())
-        message_type = message.get("type")
+# SIMP Daemon
+class SIMPDaemon:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('', CONTROL_PORT))
+        self.active_chats = {}  # Username: (address, sequence)
+        self.pending_requests = {}  # Address: username
+        self.last_received_sequence = {}  # address: sequence
 
-        if message_type == "register":
-            username = message.get("username")
-            logging.info(f"Registered client '{username}' at {addr}.")
+    def handle_message(self, message, address):
+        datagram_type, operation, sequence, username, length = parse_header(message[:39])
+        payload = message[39:].decode('ascii')
+        if address not in self.last_received_sequence:
+            self.last_received_sequence[address] = 0x01
 
-        elif message_type == "chat_request":
-            target_ip = message.get("target_ip")
-            if target_ip in active_chats:
-                error_message = {
-                    "type": "error",
-                    "message": "User already in another chat."
-                }
-                daemon_socket.sendto(json.dumps(error_message).encode(), addr)
+        if datagram_type == 0x01:  # Control datagram
+            if operation == 0x02:  # SYN (Start chat request)
+                if username in self.active_chats:
+                    # User is already in a chat
+                    response = create_header(0x01, 0x01, sequence, username, len("User already in another chat"))
+                    response += "User already in another chat".encode('ascii')
+                    self.socket.sendto(response, address)
+                else:
+                    # Add pending chat request
+                    self.pending_requests[address] = username
+                    response = create_header(0x01, 0x06, sequence, username, 0)  # Send SYN+ACK
+                    self.socket.sendto(response, address)
+                    print("Sent SYN+ACK to", username)
+
+            elif operation == 0x04:  # ACK
+                if address in self.pending_requests:
+                    user = self.pending_requests[address]
+                    self.active_chats[user] = (address, sequence) # Username as Key
+                    print("Received ACK from:", user)
+                    del self.pending_requests[address]
+
+
+            elif operation == 0x08:  # FIN (End chat request)
+                if username in self.active_chats:
+                    partner_username = None
+                    for usr, (addr,seq) in self.active_chats.items():
+                       if addr != address and usr != username:
+                            partner_username = usr
+                            break
+                    if partner_username:
+                        partner_address = self.active_chats[partner_username][0]
+                        del self.active_chats[username]
+                        del self.active_chats[partner_username]
+                        print(f"Chat with {username} ended by {username}")
+                        ack_response = create_header(0x01, 0x04, sequence, username, 0)
+                        self.socket.sendto(ack_response, partner_address)  # Send ACK to partner
+                        self.socket.sendto(ack_response, address)  # Send ACK to self
+                    else:
+                        print("No partner found to end chat.")
+                else:
+                    print("Chat ended by:", username)
+
+        elif datagram_type == 0x02:  # Chat datagram
+            if username in self.active_chats and sequence != self.last_received_sequence[address]:
+                partner_address = None
+                for usr, (addr,seq) in self.active_chats.items():
+                    if addr != address and usr != username:
+                        partner_username = usr
+                        partner_address = addr
+                        break
+                if partner_address:
+                    print(f"Message from {username}: {payload}")  # Log message on the daemon
+                    self.socket.sendto(message, partner_address)
+                    ack_response = create_header(0x01, 0x04, sequence, username, 0)
+                    self.socket.sendto(ack_response, address)  # Send ACK
+                    self.last_received_sequence[address] = sequence
+                else:
+                    print("No partner found for this message")
             else:
-                active_chats[addr[0]] = target_ip
-                logging.info(f"Chat request from {addr[0]} to {target_ip}.")
-                relay_chat_request(daemon_socket, target_ip, addr)
+                if username not in self.active_chats:
+                    print(f"Chat message received from {address}, but no active chat found.")
 
-        elif message_type == "chat_accept":
-            target_ip = message.get("target_ip")
-            logging.info(f"Chat accepted between {addr[0]} and {target_ip}.")
-            active_chats[addr[0]] = target_ip
-            notify_chat_acceptance(daemon_socket, target_ip, addr)
+    def run(self):
+        print("SIMP Daemon running on port", CONTROL_PORT)
+        while True:
+            message, address = self.socket.recvfrom(1024)
+            threading.Thread(target=self.handle_message, args=(message, address)).start()
 
-        elif message_type == "chat_decline":
-            target_ip = message.get("target_ip")
-            logging.info(f"Chat declined by {addr[0]} for {target_ip}.")
-
-        elif message_type == "chat_message":
-            relay_chat_message(daemon_socket, message, addr)
-
-        elif message_type == "quit":
-            logging.info(f"Client at {addr[0]} disconnected.")
-            if addr[0] in active_chats:
-                del active_chats[addr[0]]
-
-    except Exception as e:
-        logging.error(f"Error handling request from {addr}: {e}")
-
-def relay_chat_request(daemon_socket, target_ip, origin):
-    chat_request = {
-        "type": "chat_request",
-        "username": "User",
-        "origin_ip": origin[0]
-    }
-    daemon_socket.sendto(json.dumps(chat_request).encode(), (target_ip, CLIENT_PORT))
-
-def notify_chat_acceptance(daemon_socket, target_ip, origin):
-    acceptance_message = {
-        "type": "chat_accept",
-        "message": "Chat request accepted."
-    }
-    daemon_socket.sendto(json.dumps(acceptance_message).encode(), (target_ip, CLIENT_PORT))
-
-def relay_chat_message(daemon_socket, message, origin):
-    target_ip = active_chats.get(origin[0])
-    if target_ip:
-        daemon_socket.sendto(json.dumps(message).encode(), (target_ip, CLIENT_PORT))
-    else:
-        error_message = {
-            "type": "error",
-            "message": "Target user not available."
-        }
-        daemon_socket.sendto(json.dumps(error_message).encode(), origin)
 
 if __name__ == "__main__":
-    main()
+    daemon = SIMPDaemon()
+    daemon.run()
