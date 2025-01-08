@@ -88,8 +88,8 @@ To run the project:
 4.  **Send Messages:**
       Type `send <your message>` to send a chat message.
 
-5.  **Quit:**
-      Type `quit` to end a session and disconnect from the daemon.
+5.  **Q:**
+      Type `q` to end a session and disconnect from the daemon.
 
 ## Important Implementation Notes
 

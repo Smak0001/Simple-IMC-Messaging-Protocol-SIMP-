@@ -32,8 +32,8 @@ class SIMPDaemon:
         self.socket.bind(('', CONTROL_PORT))
         self.active_chats = {}  # Username: (address, sequence)
         self.pending_requests = {}  # Address: username
-        self.last_received_sequence = {}  # address: sequence
-        self.syn_received = {}  # Addr: syn_sequence
+        self.syn_received = {}  # Address: sequence
+        self.last_received_sequence = {}  # Address: last received sequence number
 
     def handle_message(self, message, address):
         try:
@@ -41,7 +41,7 @@ class SIMPDaemon:
             payload = message[39:].decode('ascii')
 
             if address not in self.last_received_sequence:
-                self.last_received_sequence[address] = 0x01
+                self.last_received_sequence[address] = None
 
             if datagram_type == 0x01:  # Control datagram
                 if operation == SYN:  # SYN (Start chat request)
@@ -51,8 +51,10 @@ class SIMPDaemon:
                         response += "User already in another chat".encode('ascii')
                         self.socket.sendto(response, address)
                     elif address in self.syn_received and self.syn_received[address] == sequence:
-                        print(f"Duplicate SYN received from {username}, ignoring.")
-                        return
+                        print(f"Duplicate SYN received from {username}, sending ERR.")
+                        response = create_header(0x01, ERR, sequence, username, len("Duplicate SYN received"))
+                        response += "Duplicate SYN received".encode('ascii')
+                        self.socket.sendto(response, address)
                     else:
                         # Add pending chat request
                         self.pending_requests[address] = username
@@ -64,11 +66,11 @@ class SIMPDaemon:
                 elif operation == ACK:  # ACK
                     if address in self.pending_requests:
                         user = self.pending_requests[address]
-                        self.active_chats[user] = (address, sequence) # Username as Key
+                        self.active_chats[user] = (address, sequence)  # Username as Key
                         print("Received ACK from:", user)
                         del self.pending_requests[address]
                         if address in self.syn_received:
-                           del self.syn_received[address]
+                            del self.syn_received[address]
 
                 elif operation == FIN:  # FIN (End chat request)
                     if username in self.active_chats:
@@ -85,13 +87,16 @@ class SIMPDaemon:
                             ack_response = create_header(0x01, ACK, sequence, username, 0)
                             self.socket.sendto(ack_response, partner_address)  # Send ACK to partner
                         else:
-                           print(f"Chat with {username} ended by {username}")
-                           del self.active_chats[username]
+                            print(f"Chat with {username} ended by {username}")
+                            del self.active_chats[username]
                     else:
                         print("Chat ended by:", username)
 
             elif datagram_type == CHAT:  # Chat datagram
-                if username in self.active_chats and sequence != self.last_received_sequence[address]:
+                if username in self.active_chats:
+                    if sequence == self.last_received_sequence[address]:
+                        print(f"Duplicate chat message received from {username}, ignoring.")
+                        return
                     partner_address = None
                     for usr, (addr, seq) in self.active_chats.items():
                         if addr != address and usr != username:
@@ -105,13 +110,13 @@ class SIMPDaemon:
                         self.socket.sendto(ack_response, address)  # Send ACK
                         self.last_received_sequence[address] = sequence
                     else:
-                         print("No partner found for this message")
+                        print("No partner found for this message")
                 else:
-                     if username not in self.active_chats:
-                        print(f"Chat message received from {address}, but no active chat found.")
+                    print(f"Chat message received from {address}, but no active chat found.")
 
         except Exception as e:
             print(f"Error handling message from {address}: {e}")
+
     def run(self):
         print("SIMP Daemon running on port", CONTROL_PORT)
         while True:
